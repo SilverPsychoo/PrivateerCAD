@@ -37,7 +37,7 @@ Herramienta diseñada para profesores de ingeniería que necesitan verificar la 
 
 ---
 
-## Instalación
+## Instalación para modificación
 
 ```bash
 git clone https://github.com/SilverPsychoo/PrivateerCAD.git
@@ -57,19 +57,11 @@ pip install -r requirements.txt
 .venv\Scripts\python.exe src\main.py
 ```
 
-O doble clic en `run.bat` si está en la raíz del proyecto.
-
 Al iniciar, la app pregunta si usar la API de SolidWorks. Selecciona **Sí** para obtener el análisis completo.
 
 ---
 
-## Empaquetar como .exe
-
-```bash
-build.bat
-```
-
-El ejecutable se genera en `dist/PrivateerCAD/`. Para distribuir, comparte toda esa carpeta.
+El ejecutable se genera en `dist/PrivateerCAD/`. Para distribuir, si solo quieres la app, descarga solo dist
 
 ---
 
@@ -88,9 +80,6 @@ PrivateerCAD/
 │   ├── logo.png                 # Logo de la aplicación
 │   └── icon.ico                 # Ícono del ejecutable
 ├── requirements.txt
-├── privateercad.spec            # Configuración de PyInstaller
-├── build.bat                    # Script de empaquetado
-├── run.bat                      # Script de ejecución
 └── README.md
 ```
 
