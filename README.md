@@ -87,4 +87,4 @@ PrivateerCAD/
 
 ## Licencia
 
-MIT — libre para uso académico y personal.
+Creative Commons Legal Code - Libre para uso Academico y personal, total libertad de modificación solamente si se hace sin fines de lucro.
