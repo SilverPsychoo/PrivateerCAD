@@ -61,7 +61,7 @@ Al iniciar, la app pregunta si usar la API de SolidWorks. Selecciona **Sí** par
 
 ---
 
-El ejecutable se genera en `dist/PrivateerCAD/`. Para distribuir, si solo quieres la app, descarga solo dist
+El ejecutable se genera en `dist/PrivateerCAD/`. Para distribuir, si solo quieres la app para usarla, descarga solo el Release.
 
 ---
 
