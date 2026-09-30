@@ -3,14 +3,20 @@ from __future__ import annotations
 import os
 from typing import Any, Dict
 
-import win32com.client
+try:
+    import win32com.client
+except Exception:  # Permite validar el motor fuera de Windows.
+    win32com = None
 
 from config import MAX_SHELL_COLUMNS
-from utils import fast_file_hash, format_datetime, normalize_text, safe_str, first_non_empty
+from forensics import collect_binary_evidence
+from utils import format_datetime, normalize_text, safe_str, first_non_empty
 
 
 def _read_shell_metadata(path: str) -> Dict[str, str]:
     meta: Dict[str, str] = {}
+    if win32com is None:
+        return meta
     try:
         shell = win32com.client.Dispatch("Shell.Application")
         folder = shell.Namespace(os.path.dirname(path))
@@ -34,6 +40,7 @@ def _read_shell_metadata(path: str) -> Dict[str, str]:
             "last_saved_by": ("last saved", "modificado por", "ultimo guardado", "último guardado"),
             "title":         ("title", "titulo", "título"),
             "computer_name": ("computer", "computadora", "machine", "maquina", "hostname"),
+            "owner":         ("owner", "propietario", "dueño", "dueno"),
         }
         for key, words in candidates.items():
             idx = None
@@ -65,13 +72,14 @@ def _read_ole_summary(path: str) -> Dict[str, str]:
         ole = olefile.OleFileIO(path)
         if ole.exists("\x05SummaryInformation"):
             props = ole.getproperties("\x05SummaryInformation")
+            # IDs estándar de SummaryInformation OLE.
             for prop_id, key in ((4, "author"), (8, "last_saved_by"),
-                                  (5, "last_saved_date"), (12, "created_date")):
+                                  (12, "created_date"), (13, "last_saved_date")):
                 if prop_id in props:
                     val = props[prop_id]
                     if isinstance(val, bytes):
                         val = val.decode("utf-8", "ignore")
-                    v = safe_str(val, "")
+                    v = format_datetime(val) if key.endswith("_date") else safe_str(val, "")
                     if v:
                         meta[key] = v
         if ole.exists("\x05DocumentSummaryInformation"):
@@ -102,6 +110,10 @@ def extract_fallback_document(path: str) -> Dict[str, Any]:
     last   = first_non_empty(shell_meta.get("last_saved_by"), ole_meta.get("last_saved_by"),
                               author, default="Desconocido")
     machine = first_non_empty(shell_meta.get("computer_name"), ole_meta.get("computer_name"), default="")
+    owner = first_non_empty(shell_meta.get("owner"), default="")
+    created = first_non_empty(ole_meta.get("created_date"), default="")
+    saved = first_non_empty(ole_meta.get("last_saved_date"), default="")
+    binary = collect_binary_evidence(path)
 
     from utils import normalize_text as _nt
     def _ml(a, l):
@@ -127,15 +139,25 @@ def extract_fallback_document(path: str) -> Dict[str, Any]:
         "Open_Method":        "Windows/OLE",
         "Extension":          os.path.splitext(path)[1].lower(),
         "Tamano_Bytes":       os.path.getsize(path),
-        "Hash_Corto":         fast_file_hash(path),
+        **binary,
         "Fecha_Modificacion": format_datetime(os.path.getmtime(path)),
         "Autor_Original":     safe_str(author, "Desconocido"),
         "Ultimo_Guardado":    safe_str(last, "Desconocido"),
+        "Propietario_Windows": owner,
         "Nombre_Maquina":     machine,
+        "SW_Created_Date":    created,
+        "SW_Saved_Date":      saved,
+        "SW_Author_Raw":      "" if author == "Desconocido" else author,
+        "Fecha_Creacion_SW":  created or "Desconocido",
+        "Fecha_Ultimo_Guardado_SW": saved or "Desconocido",
         "Feature_Count":      0,
         "Feature_Types":      "",
         "Feature_Names":      "",
         "Feature_Signature":  "",
+        "Feature_Structure":  "[]",
+        "Geometry_Data":      "{}",
+        "Component_Count":    0,
+        "Component_Structure": "[]",
         "Custom_Props":       custom_props,
         "Metadata_Status":    _ml(author, last),
         "Confidence":         conf,

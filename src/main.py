@@ -10,7 +10,7 @@ from PIL import Image
 
 import analizador
 import extractor
-from config import CAD_EXTENSIONS
+from config import CAD_EXTENSIONS, HIGH_RISK_THRESHOLD
 from extractor_solidworks import SolidWorksSession
 
 # ─── Paleta ──────────────────────────────────────────────────────────────────
@@ -218,9 +218,12 @@ class PrivateerCAD:
             usar_sw = False
 
         if usar_sw:
+            probe_session = None
             try:
-                self.sw_session = SolidWorksSession()
-                self.sw_session.connect()
+                # La sesión real se crea dentro del hilo de análisis. Los
+                # objetos COM de SolidWorks no deben cruzar entre hilos.
+                probe_session = SolidWorksSession()
+                probe_session.connect()
                 self.modo_solidworks = True
                 self.lbl_modo.configure(text="●  SolidWorks API", text_color=C_GREEN)
             except Exception:
@@ -231,6 +234,9 @@ class PrivateerCAD:
                     "SolidWorks no disponible",
                     "No se pudo conectar a SolidWorks.\n"
                     "Se usará el modo Windows/OLE.")
+            finally:
+                if probe_session is not None:
+                    probe_session.close()
         else:
             self.lbl_modo.configure(text="●  Windows / OLE", text_color=C_ORANGE)
 
@@ -253,8 +259,19 @@ class PrivateerCAD:
         self.relaciones_actuales = []
 
         def _run():
-            d = extractor.extraer_archivo(path, self.modo_solidworks, self.sw_session)
-            self.root.after(0, lambda: self._render_archivo(d, nombre))
+            session = None
+            try:
+                if self.modo_solidworks:
+                    try:
+                        session = SolidWorksSession()
+                        session.connect()
+                    except Exception:
+                        session = None
+                d = extractor.extraer_archivo(path, self.modo_solidworks, session)
+                self.root.after(0, lambda: self._render_archivo(d, nombre))
+            finally:
+                if session is not None:
+                    session.close()
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -373,15 +390,26 @@ class PrivateerCAD:
 
             self.root.after(0, lambda: self._set_status(f"Extrayendo {total} archivos…"))
             datos = []
-            for i, fp in enumerate(archivos):
-                prog = (i + 1) / total * 0.85
-                nb   = os.path.basename(fp)
-                self.root.after(0, lambda p=prog, n=nb, idx=i+1: (
-                    self.progress.set(p),
-                    self._set_status(f"{idx}/{total}  {n}")))
-                d = extractor.extraer_archivo(fp, self.modo_solidworks, self.sw_session)
-                if d:
-                    datos.append(d)
+            session = None
+            try:
+                if self.modo_solidworks:
+                    try:
+                        session = SolidWorksSession()
+                        session.connect()
+                    except Exception:
+                        session = None
+                for i, fp in enumerate(archivos):
+                    prog = (i + 1) / total * 0.85
+                    nb   = os.path.basename(fp)
+                    self.root.after(0, lambda p=prog, n=nb, idx=i+1: (
+                        self.progress.set(p),
+                        self._set_status(f"{idx}/{total}  {n}")))
+                    d = extractor.extraer_archivo(fp, self.modo_solidworks, session)
+                    if d:
+                        datos.append(d)
+            finally:
+                if session is not None:
+                    session.close()
 
             self.root.after(0, lambda: self._set_status("Comparando archivos…"))
             self.root.after(0, lambda: self.progress.set(0.95))
@@ -425,7 +453,7 @@ class PrivateerCAD:
         if df is not None and not df.empty:
             self.btn_exportar.configure(state="normal")
 
-        n_alto = int((df["Puntaje_Sospecha"] >= 80).sum()) if df is not None else 0
+        n_alto = int((df["Puntaje_Sospecha"] >= HIGH_RISK_THRESHOLD).sum()) if df is not None else 0
         msg = f"{total} archivos procesados"
         if n_alto:
             msg += f" · {n_alto} en ALTO RIESGO"
@@ -451,6 +479,8 @@ class PrivateerCAD:
         cols_wanted = [
             "Archivo", "Estado", "Puntaje_Sospecha", "Autor_Original",
             "SW_Created_Date", "SW_Saved_Date", "Feature_Count",
+            "Confianza_Comparacion", "Similitud_Estructura",
+            "Similitud_Geometria", "Similitud_Binaria", "Decision_Par",
             "Detalle_Sospecha", "Posible_Fuente", "Hash_Corto",
             "Tamano_Bytes", "Ruta_Completa",
         ]
@@ -528,20 +558,19 @@ class PrivateerCAD:
             ("",                                                             ""),
             ("  📁  Analizar Grupo",                                         "azul"),
             ("      Compara todos los archivos de una carpeta.",              "gris"),
-            ("      Detecta copias por fecha SW, hash y árbol de operaciones.","gris"),
-            ("      Identifica al distribuidor original.",                    "gris"),
+            ("      Contrasta procedencia, estructura, geometría y contenido.","gris"),
+            ("      Ordena coincidencias para revisión.",                    "gris"),
             ("",                                                             ""),
             ("  🕸  Red de distribución",                                    "azul"),
-            ("      Grafo visual: quién le pasó el archivo a quién.",        "gris"),
+            ("      Grafo de similitudes y posibles direcciones.",           "gris"),
             ("",                                                             ""),
             ("  " + "─" * 52,                                               "sep"),
             ("",                                                             ""),
             ("  Criterios de detección:",                                    "gris"),
-            ("    ·  Misma fecha de creación SW  → mismo origen",           "gris"),
-            ("    ·  Misma fecha de guardado SW  → copia directa",          "gris"),
-            ("    ·  Hash SHA-256 idéntico        → copia byte a byte",     "gris"),
-            ("    ·  Árbol de operaciones idéntico → mismo diseño",         "gris"),
-            ("    ·  Mismo usuario en varias piezas",                       "gris"),
+            ("    ·  SHA-256 completo y contenido interno",                 "gris"),
+            ("    ·  Árbol, parámetros y croquis",                          "gris"),
+            ("    ·  Volumen, área, caja y topología",                      "gris"),
+            ("    ·  Fechas y autor como señales auxiliares",               "gris"),
             ("",                                                             ""),
         ]
         for text, tag in lines:

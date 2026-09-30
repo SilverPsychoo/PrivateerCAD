@@ -20,7 +20,6 @@ Combinando ambos casos se detecta plagio en cualquier variante.
 """
 
 from collections import Counter, defaultdict
-from difflib import SequenceMatcher
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,11 +33,9 @@ import matplotlib.patches as mpatches
 from config import (
     GRAPH_EDGE_THRESHOLD, HIGH_RISK_THRESHOLD, SUSPECT_THRESHOLD,
     SW_DATE_COLLISION_WINDOW_SEC,
-    SCORE_HASH_IDENTICO, SCORE_FEATURE_TREE_ALTO,
-    SCORE_FEATURE_TREE_MEDIO, SCORE_FEATURE_TREE_BAJO,
-    SCORE_MISMO_FEATURE_COUNT, SCORE_MISMO_TAMANO,
     GENERIC_USERNAMES,
 )
+from detection_engine import build_cohort_context, score_pair
 from utils import normalize_text, parse_datetime_any
 
 
@@ -101,142 +98,13 @@ def _sw_saved_delta(a: Dict, b: Dict) -> Optional[float]:
     return None
 
 
-def _feature_similarity(a: Dict, b: Dict) -> float:
-    ca = int(a.get("Feature_Count") or 0)
-    cb = int(b.get("Feature_Count") or 0)
-    if ca == 0 or cb == 0:
-        return 0.0
-
-    type_a = str(a.get("Feature_Types") or "")
-    type_b = str(b.get("Feature_Types") or "")
-    name_a = str(a.get("Feature_Names") or "")
-    name_b = str(b.get("Feature_Names") or "")
-
-    sim = (0.50 * SequenceMatcher(None, f"{type_a}||{name_a}", f"{type_b}||{name_b}").ratio() +
-           0.30 * SequenceMatcher(None, type_a, type_b).ratio() +
-           0.20 * SequenceMatcher(None, name_a, name_b).ratio())
-
-    if min(ca, cb) < 4:
-        sim *= 0.75
-    return round(sim, 4)
-
-
-def _choose_source(a: Dict, b: Dict) -> Tuple[Dict, Dict]:
-    """
-    Determina cuál archivo es el original y cuál la copia.
-    Si la fecha de creación es igual (mismo origen), el guardado más antiguo es el original.
-    """
-    # Fecha de creación SW — si difieren, el más antiguo es el original
-    for field in ("SW_Created_Date", "Fecha_Creacion_SW"):
-        da = parse_datetime_any(_clean_sw_date(a.get(field)) or a.get(field))
-        db = parse_datetime_any(_clean_sw_date(b.get(field)) or b.get(field))
-        if da and db and abs((da - db).total_seconds()) > 5:
-            return (a, b) if da < db else (b, a)
-
-    # Fecha de guardado SW — si creación es igual, el guardado más antiguo es el original
-    for field in ("SW_Saved_Date", "Fecha_Ultimo_Guardado_SW"):
-        da = parse_datetime_any(_clean_sw_date(a.get(field)) or a.get(field))
-        db = parse_datetime_any(_clean_sw_date(b.get(field)) or b.get(field))
-        if da and db and abs((da - db).total_seconds()) > 5:
-            return (a, b) if da < db else (b, a)
-
-    # Fecha Windows como último recurso
-    da = parse_datetime_any(a.get("Fecha_Modificacion"))
-    db = parse_datetime_any(b.get("Fecha_Modificacion"))
-    if da and db:
-        return (a, b) if da <= db else (b, a)
-    return a, b
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Score de plagio entre un par
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _pair_score(a: Dict, b: Dict) -> Dict[str, Any]:
-    score = 0
-    reasons: List[str] = []
-
-    # ── 1. Fecha de CREACIÓN SW idéntica ──────────────────────────────────
-    # SummaryInfo[6] queda FIJA aunque el archivo se guarde de nuevo.
-    # Si dos archivos distintos tienen la misma fecha de creación → mismo origen.
-    created_delta = _sw_created_delta(a, b)
-    if created_delta is not None:
-        if created_delta <= SW_DATE_COLLISION_WINDOW_SEC:
-            score += 50
-            fc = _clean_sw_date(a.get("SW_Created_Date") or a.get("Fecha_Creacion_SW"))
-            reasons.append(f"misma fecha de creación SW ({fc}) → mismo origen")
-        elif created_delta <= 120:
-            score += 20
-            reasons.append(f"fecha de creación SW casi idéntica (Δ={created_delta:.0f}s)")
-
-    # ── 2. Fecha de GUARDADO SW idéntica ──────────────────────────────────
-    # Si además la fecha de guardado coincide → no solo mismo origen sino
-    # copia directa (nunca se volvió a guardar).
-    saved_delta = _sw_saved_delta(a, b)
-    if saved_delta is not None and saved_delta <= SW_DATE_COLLISION_WINDOW_SEC:
-        score += 15  # refuerzo adicional
-        reasons.append("fecha de guardado SW también idéntica (copia directa)")
-
-    # ── 3. Hash SHA idéntico ──────────────────────────────────────────────
-    ha = str(a.get("Hash_Corto") or "").strip()
-    hb = str(b.get("Hash_Corto") or "").strip()
-    if (ha and hb
-            and ha not in ("nan", "none", "")
-            and hb not in ("nan", "none", "")
-            and not ha.startswith("ERROR")
-            and ha == hb):
-        score += SCORE_HASH_IDENTICO
-        reasons.append("hash idéntico (copia exacta byte a byte)")
-
-    # ── 4. Similitud del Feature Tree ─────────────────────────────────────
-    feat_sim = _feature_similarity(a, b)
-    if feat_sim >= 0.98:
-        score += SCORE_FEATURE_TREE_ALTO
-        reasons.append(f"árbol de operaciones casi idéntico ({feat_sim:.0%})")
-    elif feat_sim >= 0.90:
-        score += SCORE_FEATURE_TREE_MEDIO
-        reasons.append(f"árbol de operaciones muy similar ({feat_sim:.0%})")
-    elif feat_sim >= 0.82:
-        score += SCORE_FEATURE_TREE_BAJO
-        reasons.append(f"árbol de operaciones similar ({feat_sim:.0%})")
-
-    # ── 5. Mismo número de operaciones ────────────────────────────────────
-    ca = int(a.get("Feature_Count") or 0)
-    cb = int(b.get("Feature_Count") or 0)
-    if ca > 0 and ca == cb:
-        score += SCORE_MISMO_FEATURE_COUNT
-        reasons.append(f"mismo número de operaciones ({ca})")
-
-    # ── 6. Mismo tamaño ───────────────────────────────────────────────────
-    sa = int(a.get("Tamano_Bytes") or 0)
-    sb = int(b.get("Tamano_Bytes") or 0)
-    if sa > 0 and sa == sb:
-        score += SCORE_MISMO_TAMANO
-        reasons.append("mismo tamaño de archivo")
-
-    # ── 7. Mismo autor real no genérico ───────────────────────────────────
-    aut_a = _clean_sw_date(a.get("SW_Author_Raw") or a.get("Autor_Original"))
-    aut_b = _clean_sw_date(b.get("SW_Author_Raw") or b.get("Autor_Original"))
-    if _valid_author(aut_a) and _valid_author(aut_b) and normalize_text(aut_a) == normalize_text(aut_b):
-        score += 8
-        reasons.append(f"mismo autor SW real '{aut_a}'")
-
-    score = min(score, 100)
-    source, target = _choose_source(a, b)
-
-    return {
-        "score":              score,
-        "feature_similarity": feat_sim,
-        "created_delta":      created_delta,
-        "saved_delta":        saved_delta,
-        "reasons":            reasons,
-        "source_file":  source.get("Archivo", ""),
-        "target_file":  target.get("Archivo", ""),
-        "source_path":  source.get("Ruta_Completa", source.get("Archivo", "")),
-        "target_path":  target.get("Ruta_Completa", target.get("Archivo", "")),
-        "source_data":  source,
-        "target_data":  target,
-    }
+def _pair_score(a: Dict, b: Dict, context: Optional[Dict] = None) -> Dict[str, Any]:
+    """Compatibilidad interna para el nuevo motor multiseñal."""
+    return score_pair(a, b, context)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,14 +136,13 @@ def diagnostico_unico(data: Dict[str, Any]) -> Tuple[str, str]:
     elif autor_generic:
         lines.append(f"✍️  Autor SW              : {autor}  ← PC genérica (lab/uni)")
     else:
-        lines.append(f"✍️  Autor SW              : No disponible")
+        lines.append("✍️  Autor SW              : No disponible")
 
     if propietario:
-        prop_short = propietario.split("\\")[-1] if "\\" in propietario else propietario
         lines.append(f"🖥️  Propietario Windows   : {propietario}")
-        lines.append(f"   (Quién tiene el archivo AHORA — cambia al copiarlo para revisar)")
+        lines.append("   (Quién tiene el archivo AHORA — cambia al copiarlo para revisar)")
     else:
-        lines.append(f"🖥️  Propietario Windows   : No disponible")
+        lines.append("🖥️  Propietario Windows   : No disponible")
 
     lines.append(f"📅 Fecha modificación    : {data.get('Fecha_Modificacion', '—')}")
     lines.append("")
@@ -283,11 +150,11 @@ def diagnostico_unico(data: Dict[str, Any]) -> Tuple[str, str]:
     if fc_sw:
         lines.append(f"🗓️  Creado                : {fc_sw}  ← FIJA aunque guardes de nuevo")
     else:
-        lines.append(f"🗓️  Creado                : No disponible")
+        lines.append("🗓️  Creado                : No disponible")
     if fs_sw:
         lines.append(f"🗓️  Último guardado SW    : {fs_sw}  ← cambia al volver a guardar")
     else:
-        lines.append(f"🗓️  Último guardado SW    : No disponible")
+        lines.append("🗓️  Último guardado SW    : No disponible")
 
     lines.append(f"🔧 Operaciones           : {feats}")
     lines.append(f"🔍 Confianza lectura     : {conf}/100")
@@ -305,13 +172,13 @@ def diagnostico_unico(data: Dict[str, Any]) -> Tuple[str, str]:
         estado = "LIMPIO"
         lines.append(f"\n🟢 Datos completos: autor='{autor}', {feats} operaciones,")
         lines.append(f"   fecha creación='{fc_sw}'")
-        lines.append(f"   El lote comparará estos datos contra todos los archivos del grupo.")
+        lines.append("   El lote comparará estos datos contra todos los archivos del grupo.")
     elif autor_real or fc_sw or feats > 0:
         estado = "EVIDENCIA_PARCIAL"
-        lines.append(f"\n🟠 Datos parciales — suficientes para comparar en lote.")
+        lines.append("\n🟠 Datos parciales — suficientes para comparar en lote.")
     else:
         estado = "BAJA_CONFIANZA"
-        lines.append(f"\n⚪ Datos insuficientes. El lote intentará comparar con el grupo.")
+        lines.append("\n⚪ Datos insuficientes. El lote intentará comparar con el grupo.")
 
     return "\n".join(lines), estado
 
@@ -323,6 +190,9 @@ def diagnostico_unico(data: Dict[str, Any]) -> Tuple[str, str]:
 def analizar_lote(datos: List[Dict[str, Any]]) -> Tuple[Any, str, List[Dict]]:
     if not datos:
         return None, "No se encontraron archivos CAD válidos.", []
+
+    # No modificar los diccionarios que conserva la interfaz/extractor.
+    datos = [dict(item) for item in datos]
 
     # Normalizar campos planos antes de crear el DataFrame
     for d in datos:
@@ -347,7 +217,12 @@ def analizar_lote(datos: List[Dict[str, Any]]) -> Tuple[Any, str, List[Dict]]:
         "Autor_Original": "Desconocido", "Ultimo_Guardado": "Desconocido",
         "Propietario_Windows": "", "Nombre_Maquina": "",
         "Feature_Signature": "", "Feature_Types": "", "Feature_Names": "",
+        "Feature_Structure": "[]", "Geometry_Data": "{}",
+        "Component_Count": 0, "Component_Structure": "[]",
         "Hash_Corto": "", "Fecha_Modificacion": "Desconocido",
+        "SHA256_Completo": "", "Binary_Chunk_Hashes": "",
+        "Binary_Chunk_Count": 0, "OLE_Stream_Hashes": "{}",
+        "OLE_Stream_Count": 0,
         "Tamano_Bytes": 0, "Feature_Count": 0,
         "SW_Created_Date": "", "SW_Saved_Date": "", "SW_Author_Raw": "",
         "Fecha_Creacion_SW": "", "Fecha_Ultimo_Guardado_SW": "",
@@ -362,6 +237,8 @@ def analizar_lote(datos: List[Dict[str, Any]]) -> Tuple[Any, str, List[Dict]]:
     # CRÍTICO: limpiar strings NaN que pandas genera al mezclar tipos
     str_cols = ("SW_Created_Date", "SW_Saved_Date", "SW_Author_Raw",
                 "Hash_Corto", "Feature_Types", "Feature_Names", "Feature_Signature",
+                "Feature_Structure", "Geometry_Data", "Component_Structure",
+                "SHA256_Completo", "Binary_Chunk_Hashes", "OLE_Stream_Hashes",
                 "Autor_Original", "Fecha_Modificacion",
                 "Fecha_Creacion_SW", "Fecha_Ultimo_Guardado_SW")
     for col in str_cols:
@@ -378,13 +255,14 @@ def analizar_lote(datos: List[Dict[str, Any]]) -> Tuple[Any, str, List[Dict]]:
             df.at[i, "SW_Saved_Date"] = df.at[i, "Fecha_Ultimo_Guardado_SW"]
 
     registros = df.to_dict("records")
+    cohort_context = build_cohort_context(registros)
 
     # ── Comparar TODOS los pares ──────────────────────────────────────────
     pares: List[Dict]      = []
     relaciones: List[Dict] = []
 
     for i, j in combinations(range(len(registros)), 2):
-        pair = _pair_score(registros[i], registros[j])
+        pair = _pair_score(registros[i], registros[j], cohort_context)
         pares.append(pair)
         if pair["score"] >= GRAPH_EDGE_THRESHOLD:
             relaciones.append({
@@ -394,6 +272,12 @@ def analizar_lote(datos: List[Dict[str, Any]]) -> Tuple[Any, str, List[Dict]]:
                 "target_file": pair["target_file"],
                 "score":       pair["score"],
                 "feature_similarity": pair["feature_similarity"],
+                "geometry_similarity": pair["geometry_similarity"],
+                "binary_similarity": pair["binary_similarity"],
+                "ole_similarity": pair["ole_similarity"],
+                "comparison_confidence": pair["comparison_confidence"],
+                "direction_confidence": pair["direction_confidence"],
+                "direction_basis": pair["direction_basis"],
                 "reason_str":  "; ".join(pair["reasons"]),
                 "reasons":     pair["reasons"],
             })
@@ -414,6 +298,8 @@ def analizar_lote(datos: List[Dict[str, Any]]) -> Tuple[Any, str, List[Dict]]:
 
     # ── Estado por archivo ────────────────────────────────────────────────
     estados, puntajes, detalles, fuentes = [], [], [], []
+    confianzas, similitudes_estructura, similitudes_geometria = [], [], []
+    similitudes_binarias, decisiones = [], []
     for i, row in enumerate(registros):
         match  = best_match[i]
         score  = int(match["score"]) if match else 0
@@ -430,7 +316,8 @@ def analizar_lote(datos: List[Dict[str, Any]]) -> Tuple[Any, str, List[Dict]]:
 
         # "Posible origen" solo se muestra para la COPIA (target), no para el original (source)
         fuente = ""
-        if match:
+        if (match and score >= SUSPECT_THRESHOLD
+                and float(match.get("direction_confidence", 0)) >= 0.60):
             rp = row.get("Ruta_Completa", row.get("Archivo", ""))
             es_fuente = match.get("source_path") == rp
             if not es_fuente:
@@ -442,65 +329,99 @@ def analizar_lote(datos: List[Dict[str, Any]]) -> Tuple[Any, str, List[Dict]]:
         puntajes.append(score)
         detalles.append(reason)
         fuentes.append(fuente)
+        confianzas.append(match.get("comparison_confidence", "BAJA") if match else "BAJA")
+        similitudes_estructura.append(match.get("feature_similarity", 0) if match else 0)
+        similitudes_geometria.append(match.get("geometry_similarity", 0) if match else 0)
+        similitudes_binarias.append(
+            max(match.get("binary_similarity", 0), match.get("ole_similarity", 0)) if match else 0
+        )
+        decisiones.append(match.get("decision", "SIN_COINCIDENCIA_RELEVANTE") if match else "SIN_COINCIDENCIA_RELEVANTE")
 
     df["Puntaje_Sospecha"] = puntajes
     df["Estado"]           = estados
     df["Detalle_Sospecha"] = detalles
     df["Posible_Fuente"]   = fuentes
+    df["Confianza_Comparacion"] = confianzas
+    df["Similitud_Estructura"] = similitudes_estructura
+    df["Similitud_Geometria"] = similitudes_geometria
+    df["Similitud_Binaria"] = similitudes_binarias
+    df["Decision_Par"] = decisiones
 
     # ── Detecciones especiales ────────────────────────────────────────────
-    col_created  = _detectar_colisiones_fecha_creacion(registros)
-    col_saved    = _detectar_colisiones_fecha_guardado(registros)
-    grupos_fc    = _agrupar_por_feature_count(registros)
+    col_created  = _detectar_colisiones_fecha_creacion(registros, pares)
+    col_saved    = _detectar_colisiones_fecha_guardado(registros, pares)
     grupos_autor = _agrupar_por_autor(registros)
     paciente     = _detectar_paciente_cero(registros, relaciones)
+    duplicados_exactos = [pair for pair in pares if pair.get("exact_hash")]
 
     # ── Reporte ───────────────────────────────────────────────────────────
     total         = len(df)
     n_alto        = int((df["Puntaje_Sospecha"] >= HIGH_RISK_THRESHOLD).sum())
-    n_sospechosos = int((df["Puntaje_Sospecha"] >= SUSPECT_THRESHOLD).sum())
+    n_sospechosos = int(((df["Puntaje_Sospecha"] >= SUSPECT_THRESHOLD) &
+                         (df["Puntaje_Sospecha"] < HIGH_RISK_THRESHOLD)).sum())
 
     sep   = "─" * 62
     lines = []
     lines.append(sep)
     lines.append(f"  REPORTE DE ANÁLISIS  —  {total} archivos")
     lines.append(sep)
-    lines.append(f"  🔴 ALTO RIESGO (plagio muy probable) : {n_alto}")
-    lines.append(f"  🟠 SOSPECHOSOS                       : {n_sospechosos}")
+    lines.append(f"  🔴 COINCIDENCIA FUERTE — revisar : {n_alto}")
+    lines.append(f"  🟠 COINCIDENCIA SOSPECHOSA        : {n_sospechosos}")
     lines.append("")
 
-    # Copias con misma fecha de CREACIÓN (caso "abrió y guardó")
+    if duplicados_exactos:
+        lines.append("🚨 DUPLICADOS EXACTOS (SHA-256 completo):")
+        for pair in duplicados_exactos:
+            lines.append(f"   ↔  {pair['source_file']}  ==  {pair['target_file']}")
+        lines.append("")
+
     if col_created:
-        lines.append("🚨 MISMO ORIGEN DETECTADO (fecha de creación SW idéntica):")
-        lines.append("   La fecha de creación SW no cambia aunque el archivo se vuelva a guardar.")
-        lines.append("   Si dos archivos la tienen igual → se crearon en la misma sesión.")
+        lines.append("⚠️  FECHA DE CREACIÓN SW COINCIDENTE, CON OTRA EVIDENCIA:")
+        lines.append("   La fecha se usa como procedencia; nunca decide el resultado por sí sola.")
         lines.append("")
         for col in col_created:
             lines.append(f"   ↔  {col['a']}")
             lines.append(f"      {col['b']}")
-            lines.append(f"      Fecha creación SW: {col['fecha']}  (Δ={col['delta']:.1f}s)")
+            lines.append(
+                f"      Fecha: {col['fecha']}  (Δ={col['delta']:.1f}s) · "
+                f"Score {col['score']}/100"
+            )
         lines.append("")
 
-    # Copias exactas (misma fecha guardado)
     if col_saved:
-        lines.append("🚨 COPIAS EXACTAS (fecha de guardado SW idéntica):")
-        lines.append("   Estos archivos son idénticos — se copiaron sin abrir.")
+        lines.append("⚠️  FECHA DE GUARDADO SW COINCIDENTE, CON OTRA EVIDENCIA:")
+        lines.append("   Es una señal auxiliar; la igualdad exacta solo la confirma SHA-256.")
         lines.append("")
         for col in col_saved:
-            lines.append(f"   ↔  {col['a']}  ==  {col['b']}")
-            lines.append(f"      Fecha guardado SW: {col['fecha']}  (Δ={col['delta']:.1f}s)")
+            lines.append(f"   ↔  {col['a']}  /  {col['b']}")
+            lines.append(
+                f"      Fecha: {col['fecha']}  (Δ={col['delta']:.1f}s) · "
+                f"Score {col['score']}/100"
+            )
         lines.append("")
 
-    # Mismo número de operaciones
-    if grupos_fc:
-        lines.append("⚠️  MISMO NÚMERO DE OPERACIONES (posible copia):")
-        for fc, archivos in grupos_fc.items():
-            lines.append(f"   {fc} operaciones: {', '.join(archivos)}")
+    pares_relevantes = sorted(
+        (pair for pair in pares if pair["score"] >= SUSPECT_THRESHOLD),
+        key=lambda pair: pair["score"], reverse=True,
+    )
+    if pares_relevantes:
+        lines.append("COINCIDENCIAS ENTRE ARCHIVOS:")
+        for pair in pares_relevantes:
+            lines.append(
+                f"   {pair['source_file']}  ↔  {pair['target_file']}  ·  "
+                f"{pair['score']}/100  ·  confianza {pair['comparison_confidence'].lower()}"
+            )
+            if pair["reasons"]:
+                lines.append(f"      {'; '.join(pair['reasons'])}")
+            if pair.get("direction_confidence", 0) >= 0.60:
+                lines.append(
+                    f"      Posible dirección: {pair['source_file']} → {pair['target_file']} "
+                    f"({pair['direction_basis']})"
+                )
         lines.append("")
 
-    # Paciente cero
-    if paciente and _valid_author(paciente["nombre"]):
-        lines.append(f"🦠 DISTRIBUIDOR ORIGINAL (paciente cero): '{paciente['nombre']}'")
+    if paciente:
+        lines.append(f"🦠 POSIBLE ARCHIVO DE ORIGEN: '{paciente['nombre']}'")
         lines.append(f"   Certeza: {paciente.get('certeza', '—')}")
         if paciente.get("fecha_sw"):
             lines.append(f"   Fecha SW más antigua: {paciente['fecha_sw']}")
@@ -528,6 +449,7 @@ def analizar_lote(datos: List[Dict[str, Any]]) -> Tuple[Any, str, List[Dict]]:
 
         lines.append(f"{icon} {row['Archivo']}")
         lines.append(f"   Estado       : {row['Estado']}  |  Score: {row['Puntaje_Sospecha']}/100")
+        lines.append(f"   Confianza    : {row['Confianza_Comparacion']}")
         lines.append(f"   Autor SW     : {autor_d}")
         if fc_d:
             lines.append(f"   Creado SW    : {fc_d}")
@@ -548,45 +470,46 @@ def analizar_lote(datos: List[Dict[str, Any]]) -> Tuple[Any, str, List[Dict]]:
 # Detectores de patrones
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _detectar_colisiones_fecha_creacion(registros: List[Dict]) -> List[Dict]:
-    """Pares con la misma fecha de CREACIÓN SW (±5s). Detecta 'mismo origen'."""
+def _detectar_colisiones_fecha_creacion(
+    registros: List[Dict], pares: Optional[List[Dict]] = None
+) -> List[Dict]:
+    """Fechas de creación coincidentes que además superan el umbral de revisión."""
     cols = []
-    for i, j in combinations(range(len(registros)), 2):
+    for pair_index, (i, j) in enumerate(combinations(range(len(registros)), 2)):
         a, b = registros[i], registros[j]
         delta = _sw_created_delta(a, b)
-        if delta is not None and delta <= SW_DATE_COLLISION_WINDOW_SEC:
+        pair = pares[pair_index] if pares and pair_index < len(pares) else _pair_score(a, b)
+        if (delta is not None and delta <= SW_DATE_COLLISION_WINDOW_SEC
+                and pair.get("score", 0) >= SUSPECT_THRESHOLD):
             cols.append({
                 "a":     a.get("Archivo", ""),
                 "b":     b.get("Archivo", ""),
                 "delta": delta,
                 "fecha": _clean_sw_date(a.get("SW_Created_Date") or a.get("Fecha_Creacion_SW")),
+                "score": pair.get("score", 0),
             })
     return cols
 
 
-def _detectar_colisiones_fecha_guardado(registros: List[Dict]) -> List[Dict]:
-    """Pares con la misma fecha de GUARDADO SW (±5s). Detecta copias exactas."""
+def _detectar_colisiones_fecha_guardado(
+    registros: List[Dict], pares: Optional[List[Dict]] = None
+) -> List[Dict]:
+    """Fechas de guardado coincidentes que además tienen evidencia corroborante."""
     cols = []
-    for i, j in combinations(range(len(registros)), 2):
+    for pair_index, (i, j) in enumerate(combinations(range(len(registros)), 2)):
         a, b = registros[i], registros[j]
         delta = _sw_saved_delta(a, b)
-        if delta is not None and delta <= SW_DATE_COLLISION_WINDOW_SEC:
+        pair = pares[pair_index] if pares and pair_index < len(pares) else _pair_score(a, b)
+        if (delta is not None and delta <= SW_DATE_COLLISION_WINDOW_SEC
+                and pair.get("score", 0) >= SUSPECT_THRESHOLD):
             cols.append({
                 "a":     a.get("Archivo", ""),
                 "b":     b.get("Archivo", ""),
                 "delta": delta,
                 "fecha": _clean_sw_date(a.get("SW_Saved_Date") or a.get("Fecha_Ultimo_Guardado_SW")),
+                "score": pair.get("score", 0),
             })
     return cols
-
-
-def _agrupar_por_feature_count(registros: List[Dict]) -> Dict[int, List[str]]:
-    grupos: Dict[int, List[str]] = defaultdict(list)
-    for r in registros:
-        fc = int(r.get("Feature_Count") or 0)
-        if fc >= 3:
-            grupos[fc].append(r.get("Archivo", ""))
-    return {k: v for k, v in grupos.items() if len(v) >= 2}
 
 
 def _agrupar_por_autor(registros: List[Dict]) -> Dict[str, List[str]]:
@@ -600,90 +523,42 @@ def _agrupar_por_autor(registros: List[Dict]) -> Dict[str, List[str]]:
 
 def _detectar_paciente_cero(registros: List[Dict],
                              relaciones: List[Dict]) -> Optional[Dict]:
-    """
-    Determina quién es el distribuidor original (paciente cero) con certeza.
+    """Propone un origen solo con varias aristas fuertes y dirección sustentada."""
+    firmes = [
+        rel for rel in relaciones
+        if rel.get("score", 0) >= HIGH_RISK_THRESHOLD
+        and float(rel.get("direction_confidence", 0)) >= 0.60
+    ]
+    if not firmes:
+        return None
 
-    Estrategia:
-    1. Si hay relaciones en el grafo: el nodo con más aristas SALIENTES es
-       el que distribuyó. Entre empates, el que tiene fecha SW de CREACIÓN
-       más antigua es el original.
-    2. Si no hay grafo pero sí colisiones de fecha SW: el archivo con la
-       fecha SW más antigua es el original (creó el archivo antes).
-    3. Fallback: autor SW no genérico que aparece en más archivos.
-    """
-    if relaciones:
-        out_deg = Counter(r["source_file"] for r in relaciones)
-        in_deg  = Counter(r["target_file"]  for r in relaciones)
+    out_deg = Counter(rel["source"] for rel in firmes)
+    in_deg = Counter(rel["target"] for rel in firmes)
+    source_path, salidas = out_deg.most_common(1)[0]
+    # Una sola pareja no permite inferir quién distribuyó el archivo.
+    if salidas < 2:
+        return None
 
-        if not out_deg:
-            return None
-
-        # Entre los que tienen más salidas, el más antiguo es el original
-        max_out = out_deg.most_common(1)[0][1]
-        top_sources = [f for f, c in out_deg.items() if c == max_out]
-
-        # Resolver empate por fecha SW de creación más antigua
-        best = None
-        best_dt = None
-        for fname in top_sources:
-            rec = next((r for r in registros if r.get("Archivo") == fname), None)
-            if rec:
-                dt = parse_datetime_any(_clean_sw_date(
-                    rec.get("SW_Created_Date") or rec.get("Fecha_Creacion_SW")
-                ))
-                if best_dt is None or (dt and dt < best_dt):
-                    best_dt  = dt
-                    best     = fname
-
-        nombre = best or top_sources[0]
-        return {
-            "nombre":    nombre,
-            "salidas":   out_deg[nombre],
-            "entradas":  in_deg.get(nombre, 0),
-            "certeza":   "ALTA — aparece como fuente en el grafo de relaciones",
-            "fecha_sw":  best_dt.strftime("%Y-%m-%d %H:%M") if best_dt else "",
-        }
-
-    # Sin grafo: buscar el más antiguo entre archivos con la misma fecha de creación
-    # Agrupar por SW_Created_Date
-    grupos_creacion: Dict[str, List[Dict]] = defaultdict(list)
-    for r in registros:
-        fc = _clean_sw_date(r.get("SW_Created_Date") or r.get("Fecha_Creacion_SW"))
-        if fc:
-            # Redondear a minuto para agrupar variantes del mismo archivo
-            dt = parse_datetime_any(fc)
-            if dt:
-                key = dt.strftime("%Y-%m-%d %H:%M")
-                grupos_creacion[key].append(r)
-
-    for key, grupo in grupos_creacion.items():
-        if len(grupo) >= 2:
-            # El más antiguo por fecha de modificación Windows
-            mas_antiguo = min(
-                grupo,
-                key=lambda r: parse_datetime_any(r.get("Fecha_Modificacion")) or
-                              __import__("datetime").datetime.max
-            )
-            return {
-                "nombre":   mas_antiguo.get("Archivo", ""),
-                "salidas":  len(grupo) - 1,
-                "entradas": 0,
-                "certeza":  "MEDIA — mismo origen SW, archivo Windows más antiguo",
-                "fecha_sw": key,
-            }
-
-    # Fallback: autor SW real más repetido
-    c: Counter = Counter()
-    for r in registros:
-        a = _clean_sw_date(r.get("SW_Author_Raw") or r.get("Autor_Original"))
-        if _valid_author(a):
-            c[a] += 1
-    if c:
-        nombre, count = c.most_common(1)[0]
-        if count >= 2:
-            return {"nombre": nombre, "salidas": count, "entradas": 0,
-                    "certeza": "BAJA — mismo autor en múltiples archivos", "fecha_sw": ""}
-    return None
+    record = next(
+        (row for row in registros
+         if (row.get("Ruta_Completa") or row.get("Archivo", "")) == source_path),
+        None,
+    )
+    if not record:
+        return None
+    date = parse_datetime_any(_clean_sw_date(
+        record.get("SW_Created_Date") or record.get("Fecha_Creacion_SW")
+    ))
+    related = [rel for rel in firmes if rel["source"] == source_path]
+    avg_direction = sum(float(rel.get("direction_confidence", 0)) for rel in related) / len(related)
+    certainty = "ALTA" if avg_direction >= 0.70 and salidas >= 3 else "MEDIA"
+    return {
+        "nombre": record.get("Archivo", ""),
+        "salidas": salidas,
+        "entradas": in_deg.get(source_path, 0),
+        "certeza": f"{certainty} — varias coincidencias fuertes apuntan al mismo archivo",
+        "fecha_sw": date.strftime("%Y-%m-%d %H:%M") if date else "",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -713,7 +588,8 @@ def mostrar_grafo(df, relaciones: List[Dict]) -> None:
     for rel in relaciones:
         G.add_edge(rel["source"], rel["target"],
                    weight=rel["score"],
-                   reasons=rel.get("reason_str", ""))
+                   reasons=rel.get("reason_str", ""),
+                   direction_confidence=rel.get("direction_confidence", 0))
 
     fig, ax = plt.subplots(figsize=(15, 10))
     fig.patch.set_facecolor("#1a1a2e")
@@ -741,11 +617,25 @@ def mostrar_grafo(df, relaciones: List[Dict]) -> None:
     nx.draw_networkx_labels(G, pos, labels=labels, ax=ax,
                             font_size=8, font_color="white", font_weight="bold")
 
-    edge_weights = [G[u][v]["weight"] for u, v in G.edges()]
-    nx.draw_networkx_edges(G, pos, ax=ax, edge_color="#f39c12", arrows=True,
-                           arrowstyle="->", arrowsize=18,
-                           width=[max(0.5, w / 20) for w in edge_weights],
-                           alpha=0.85, connectionstyle="arc3,rad=0.08")
+    directed_edges = [
+        (u, v) for u, v in G.edges()
+        if float(G[u][v].get("direction_confidence", 0)) >= 0.60
+    ]
+    ambiguous_edges = [edge for edge in G.edges() if edge not in directed_edges]
+    if directed_edges:
+        nx.draw_networkx_edges(
+            G, pos, ax=ax, edgelist=directed_edges, edge_color="#f39c12", arrows=True,
+            arrowstyle="->", arrowsize=18,
+            width=[max(0.5, G[u][v]["weight"] / 20) for u, v in directed_edges],
+            alpha=0.85, connectionstyle="arc3,rad=0.08",
+        )
+    if ambiguous_edges:
+        nx.draw_networkx_edges(
+            G, pos, ax=ax, edgelist=ambiguous_edges, edge_color="#95a5a6", arrows=False,
+            style="dashed",
+            width=[max(0.5, G[u][v]["weight"] / 20) for u, v in ambiguous_edges],
+            alpha=0.75, connectionstyle="arc3,rad=0.08",
+        )
 
     edge_labels = {(u, v): f"{G[u][v]['weight']}" for u, v in G.edges()}
     nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, ax=ax,

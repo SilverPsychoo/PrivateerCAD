@@ -65,20 +65,20 @@ def coerce_tuple_first(result: Any, default: Any = None) -> Any:
 
 
 def fast_file_hash(path: str, block_size: int = 1024 * 1024) -> str:
-    """Hash rápido: tamaño + primer MB + último MB."""
+    """SHA-256 completo del archivo, leído por bloques.
+
+    El nombre se conserva por compatibilidad con extractores anteriores. La
+    versión previa solo leía los extremos del archivo y podía considerar
+    iguales dos documentos con cambios en la zona central.
+    """
     h = hashlib.sha256()
     try:
-        size = os.path.getsize(path)
-        h.update(str(size).encode("utf-8", "ignore"))
         with open(path, "rb") as f:
-            first = f.read(block_size)
-            h.update(first)
-            if size > block_size * 2:
-                f.seek(max(0, size - block_size))
-                h.update(f.read(block_size))
-            elif size > block_size:
-                f.seek(block_size)
-                h.update(f.read())
+            while True:
+                block = f.read(block_size)
+                if not block:
+                    break
+                h.update(block)
     except Exception as exc:
         return f"ERROR_HASH:{exc}"
     return h.hexdigest()

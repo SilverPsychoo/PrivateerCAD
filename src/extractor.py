@@ -32,10 +32,15 @@ def extraer_archivo(path: str, usar_solidworks: bool = False,
             fallback["Open_Method"]      = f"{data.get('Open_Method', '')} -> Windows/OLE"
             fallback["SolidWorks_Error"] = data.get("Error", "")
             for key in ("Hash_Corto", "Tamano_Bytes", "Fecha_Modificacion",
+                        "SHA256_Completo", "Binary_Chunk_Hashes",
+                        "Binary_Chunk_Count", "OLE_Stream_Hashes",
+                        "OLE_Stream_Count",
                         "SW_Created_Date", "SW_Saved_Date", "SW_Author_Raw",
                         "Fecha_Creacion_SW", "Fecha_Ultimo_Guardado_SW",
                         "Autor_Original", "Feature_Count", "Feature_Types",
-                        "Feature_Names", "Feature_Signature", "Summary_Info",
+                        "Feature_Names", "Feature_Signature", "Feature_Structure",
+                        "Geometry_Data", "Component_Count", "Component_Structure",
+                        "Summary_Info",
                         "Propietario_Windows", "Nombre_Maquina", "Confidence"):
                 val = data.get(key)
                 if val and val not in ("Desconocido", "", 0, {}):

@@ -23,6 +23,7 @@ Desktop.ini
 # IDEs
 .vscode/
 .idea/
+.ruff_cache/
 *.suo
 *.user
 

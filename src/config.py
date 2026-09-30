@@ -4,25 +4,9 @@ APP_GEOMETRY = "1180x820"
 CAD_EXTENSIONS = (".sldprt", ".sldasm")
 
 # ── Umbrales de similitud ──────────────────────────────────────────────────
-FEATURE_SIM_THRESHOLD   = 0.92
-GRAPH_EDGE_THRESHOLD    = 40   # umbral para dibujar arista en grafo
-HIGH_RISK_THRESHOLD     = 50   # "ALTO RIESGO" — hash idéntico (40) + tamaño (5) ya supera
-SUSPECT_THRESHOLD       = 30   # "SOSPECHOSO" — misma fecha creación sola (20pt)
-
-# ── Pesos del score de plagio (sobre 100) ─────────────────────────────────
-SCORE_HASH_IDENTICO         = 55   # hash SHA idéntico → copia exacta → ALTO RIESGO solo
-SCORE_AUTOR_DISTINTO        = 30   # SW-Author ≠ SW-Last Saved By
-SCORE_FEATURE_TREE_ALTO     = 35   # similarity ≥ 0.98
-SCORE_FEATURE_TREE_MEDIO    = 22   # similarity ≥ 0.90
-SCORE_FEATURE_TREE_BAJO     = 12   # similarity ≥ 0.82
-SCORE_TIMESTAMP_COLISION    = 25   # misma hora guardado ± 60 s
-SCORE_MISMA_MAQUINA         = 18   # mismo hostname
-SCORE_MISMO_FEATURE_COUNT   = 7
-SCORE_MISMO_TAMANO          = 5
-SCORE_METADATA_COMPATIBLE   = 8    # autor_A == last_saved_B
-
-# ── Ventana de colisión de timestamps (segundos) ──────────────────────────
-TIMESTAMP_COLLISION_WINDOW_SEC = 60
+GRAPH_EDGE_THRESHOLD    = 45   # solo relaciones que ya ameritan revisión
+HIGH_RISK_THRESHOLD     = 75   # requiere duplicado exacto o señales fuertes corroboradas
+SUSPECT_THRESHOLD       = 45   # una fecha o el mismo conteo nunca llegan solos
 
 # ── Features ignorados en árbol de operaciones ────────────────────────────
 IGNORED_FEATURE_TYPES = {
@@ -94,4 +78,3 @@ GENERIC_USERNAMES = {
 # del archivo y NO cambia cuando alguien lo copia en otra PC.
 # Si dos archivos tienen la misma fecha SW ± esta ventana → mismo archivo.
 SW_DATE_COLLISION_WINDOW_SEC = 5   # muy estricto: 5 segundos
-

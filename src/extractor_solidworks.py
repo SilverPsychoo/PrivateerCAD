@@ -16,19 +16,26 @@ Para detectar copias cuando alguien "abre y guarda":
   - Feature tree idéntico              → misma pieza
 """
 
+import json
+import math
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-import pythoncom
-import win32com.client
+try:
+    import pythoncom
+    import win32com.client
+except Exception:  # El modo OLE puede seguir funcionando fuera de Windows.
+    pythoncom = None
+    win32com = None
 
 from config import (
     CAD_EXTENSIONS, IGNORED_FEATURE_TYPES,
     PROBE_PROPERTY_NAMES, SW_SUMMARY_INFO_FIELDS, SW_SUMMARY_INFO_EXTRA,
 )
+from forensics import collect_binary_evidence
 from utils import (
-    coerce_tuple_first, fast_file_hash, format_datetime, normalize_text,
+    coerce_tuple_first, format_datetime, normalize_text,
 )
 
 
@@ -42,6 +49,8 @@ class SolidWorksSession:
         self._co_initialized = False
 
     def connect(self):
+        if pythoncom is None or win32com is None:
+            raise RuntimeError("La API de SolidWorks requiere Windows y pywin32")
         if self.app is not None:
             # Verificar que la sesión sigue viva
             try:
@@ -132,7 +141,7 @@ def _open_document(sw_app, path: str) -> Tuple[Any, str]:
     try:
         spec = sw_app.GetOpenDocSpec(path)
         if spec is not None:
-            for a, v in (("Silent", True), ("ReadOnly", False),
+            for a, v in (("Silent", True), ("ReadOnly", True),
                          ("AddToRecentDocumentList", False),
                          ("LightWeight", False), ("LoadModel", True)):
                 _set_safe(spec, a, v)
@@ -142,7 +151,8 @@ def _open_document(sw_app, path: str) -> Tuple[Any, str]:
     except Exception:
         pass
     try:
-        m = _unwrap(sw_app.OpenDoc6(path, doc_type, 0, "", 0, 0))
+        # swOpenDocOptions_Silent (1) | swOpenDocOptions_ReadOnly (2)
+        m = _unwrap(sw_app.OpenDoc6(path, doc_type, 3, "", 0, 0))
         if m is not None:
             return m, "OpenDoc6"
     except Exception:
@@ -554,22 +564,111 @@ def _feat_sub(feat) -> Any:
     return None
 
 
-def _walk(first, depth: int = 0) -> List[Dict]:
-    rows: List[Dict] = []
-    feat = first
-    while feat is not None:
+def _member(obj: Any, names: Tuple[str, ...], *args, default: Any = None) -> Any:
+    """Lee una propiedad COM o llama un método sin asumir late/early binding."""
+    for name in names:
         try:
-            ftype = _feat_type(feat)
-            fname = _feat_name(feat)
-            if ftype and ftype not in IGNORED_FEATURE_TYPES:
-                rows.append({
-                    "depth": depth, "type": ftype, "name": fname,
-                    "token_type": normalize_text(ftype),
-                    "token_name": normalize_text(fname),
-                })
+            value = getattr(obj, name)
+            return value(*args) if callable(value) else value
+        except Exception:
+            continue
+    return default
+
+
+def _as_objects(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if item is not None]
+    return [value]
+
+
+def _feature_parameters(feat: Any, limit: int = 20) -> List[float]:
+    """Obtiene dimensiones del feature sin editar ni seleccionar el modelo."""
+    values: List[float] = []
+    display = _member(feat, ("GetFirstDisplayDimension",), default=None)
+    seen = set()
+    while display is not None and len(values) < limit:
+        marker = repr(display)
+        if marker in seen:
+            break
+        seen.add(marker)
+        dimension = _member(display, ("GetDimension2",), 0, default=None)
+        if dimension is None:
+            dimension = _member(display, ("GetDimension",), default=None)
+        raw = _member(dimension, ("SystemValue", "GetSystemValue3"), default=None)
+        candidates = raw if isinstance(raw, (list, tuple)) else (raw,)
+        for candidate in candidates:
+            try:
+                number = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                values.append(round(number, 10))
+                if len(values) >= limit:
+                    break
+        display = _member(display, ("GetNext5", "GetNext"), default=None)
+    return values
+
+
+def _sketch_signature(feat: Any) -> Dict[str, int]:
+    specific = _member(feat, ("GetSpecificFeature2",), default=None)
+    if specific is None:
+        return {}
+    segments = _as_objects(_member(specific, ("GetSketchSegments",), default=None))
+    points = _as_objects(_member(specific, ("GetSketchPoints2", "GetSketchPoints"), default=None))
+    if not segments and not points:
+        return {}
+
+    by_type: Dict[str, int] = {}
+    for segment in segments[:1000]:
+        raw_type = _member(segment, ("GetType",), default="segment")
+        key = str(raw_type)
+        by_type[key] = by_type.get(key, 0) + 1
+    result = {f"segment_{key}": count for key, count in sorted(by_type.items())}
+    result["segments"] = len(segments)
+    result["points"] = len(points)
+    return result
+
+
+def _feature_row(feat: Any, depth: int) -> Optional[Dict[str, Any]]:
+    ftype = _feat_type(feat)
+    if not ftype or ftype in IGNORED_FEATURE_TYPES:
+        return None
+    fname = _feat_name(feat)
+    return {
+        "depth": depth,
+        "type": ftype,
+        "name": fname,
+        "token_type": normalize_text(ftype),
+        "token_name": normalize_text(fname),
+        "parameters": _feature_parameters(feat),
+        "sketch": _sketch_signature(feat),
+    }
+
+
+def _walk(
+    first, depth: int = 0,
+    _seen: Optional[set] = None,
+    _budget: Optional[List[int]] = None,
+) -> List[Dict]:
+    rows: List[Dict] = []
+    _seen = _seen if _seen is not None else set()
+    _budget = _budget if _budget is not None else [5000]
+    feat = first
+    while feat is not None and _budget[0] > 0:
+        marker = repr(feat)
+        if marker in _seen:
+            break
+        _seen.add(marker)
+        _budget[0] -= 1
+        try:
+            row = _feature_row(feat, depth)
+            if row:
+                rows.append(row)
             sub = _feat_sub(feat)
             if sub is not None:
-                rows.extend(_walk(sub, depth + 1))
+                rows.extend(_walk(sub, depth + 1, _seen, _budget))
         except Exception:
             pass
         feat = _feat_next(feat)
@@ -615,14 +714,9 @@ def _read_features(model) -> List[Dict]:
                 if feat is None:
                     continue
                 try:
-                    ft  = _feat_type(feat)
-                    fn2 = _feat_name(feat)
-                    if ft and ft not in IGNORED_FEATURE_TYPES:
-                        rows.append({
-                            "depth": 0, "type": ft, "name": fn2,
-                            "token_type": normalize_text(ft),
-                            "token_name": normalize_text(fn2),
-                        })
+                    row = _feature_row(feat, 0)
+                    if row:
+                        rows.append(row)
                 except Exception:
                     pass
             if rows:
@@ -637,6 +731,95 @@ def _sig(rows: List[Dict]) -> str:
     t = " > ".join(r["token_type"] for r in rows if r.get("token_type"))
     n = " > ".join(r["token_name"] for r in rows if r.get("token_name"))
     return f"{t} | {n}".strip(" |")
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(number, 12) if math.isfinite(number) else None
+
+
+def _number_list(value: Any) -> List[float]:
+    raw = value if isinstance(value, (list, tuple)) else ()
+    output: List[float] = []
+    for item in raw:
+        number = _finite_number(item)
+        if number is not None:
+            output.append(number)
+    return output
+
+
+def _read_geometry(model: Any) -> Dict[str, Any]:
+    """Extrae invariantes geométricos mediante API pública de SolidWorks."""
+    geometry: Dict[str, Any] = {}
+    ext = _get_ext(model)
+    mass_prop = None
+    if ext is not None:
+        mass_prop = _member(ext, ("CreateMassProperty2", "CreateMassProperty"), default=None)
+
+    if mass_prop is not None:
+        for target, members in (
+            ("mass", ("Mass",)),
+            ("volume", ("Volume",)),
+            ("surface_area", ("SurfaceArea",)),
+        ):
+            number = _finite_number(_member(mass_prop, members, default=None))
+            if number is not None:
+                geometry[target] = number
+        center = _number_list(_member(mass_prop, ("CenterOfMass",), default=None))
+        if len(center) >= 3:
+            geometry["center_of_mass"] = center[:3]
+        moments = _number_list(_member(
+            mass_prop, ("PrincipalMomentsOfInertia", "GetPrincipalMomentsOfInertia"),
+            default=None,
+        ))
+        if moments:
+            geometry["principal_moments"] = sorted(moments[:3])
+        assigned = _member(mass_prop, ("UserAssigned",), default=None)
+        if isinstance(assigned, bool):
+            geometry["user_assigned_mass"] = assigned
+
+    box = _member(model, ("GetPartBox",), True, default=None)
+    if box is None:
+        box = _member(model, ("GetBox",), 1, default=None)
+    box_values = _number_list(box)
+    if len(box_values) >= 6:
+        dims = [abs(box_values[i + 3] - box_values[i]) for i in range(3)]
+        geometry["bbox_dimensions"] = sorted(round(v, 12) for v in dims)
+
+    bodies = _as_objects(_member(model, ("GetBodies2",), -1, True, default=None))
+    if not bodies:
+        bodies = _as_objects(_member(model, ("GetBodies2",), 0, True, default=None))
+    if bodies:
+        face_count = 0
+        edge_count = 0
+        for body in bodies[:500]:
+            face_count += len(_as_objects(_member(body, ("GetFaces",), default=None)))
+            edge_count += len(_as_objects(_member(body, ("GetEdges",), default=None)))
+        geometry["body_count"] = len(bodies)
+        geometry["face_count"] = face_count
+        geometry["edge_count"] = edge_count
+
+    return geometry
+
+
+def _read_components(model: Any) -> List[Dict[str, Any]]:
+    components = _as_objects(_member(model, ("GetComponents",), False, default=None))
+    rows: List[Dict[str, Any]] = []
+    for component in components[:5000]:
+        name = str(_member(component, ("Name2", "Name"), default="") or "")
+        path = str(_member(component, ("GetPathName",), default="") or "")
+        config = str(_member(component, ("ReferencedConfiguration",), default="") or "")
+        suppression = _member(component, ("GetSuppression2", "GetSuppression"), default="")
+        rows.append({
+            "name": normalize_text(re.sub(r"-\d+$", "", name)),
+            "file": normalize_text(os.path.basename(path)),
+            "configuration": normalize_text(config),
+            "suppression": str(suppression),
+        })
+    return rows
 
 
 
@@ -654,6 +837,8 @@ def _mlabel(a: str, l: str) -> str:
 
 
 def extract_solidworks_document(path: str, session: SolidWorksSession) -> Dict[str, Any]:
+    exists = os.path.isfile(path)
+    binary_info = collect_binary_evidence(path) if exists else collect_binary_evidence("")
     _base: Dict[str, Any] = {
         "Archivo": os.path.basename(path), "Ruta_Completa": path,
         "Modo": "solidworks_api", "Open_Method": "",
@@ -662,13 +847,15 @@ def extract_solidworks_document(path: str, session: SolidWorksSession) -> Dict[s
         "SW_Created_Date": "", "SW_Saved_Date": "",
         "Fecha_Creacion_SW": "Desconocido", "Fecha_Ultimo_Guardado_SW": "Desconocido",
         "SW_Author_Raw": "",
-        # Hash y tamaño siempre disponibles (no requieren SW)
-        "Hash_Corto":   fast_file_hash(path) if os.path.isfile(path) else "",
-        "Tamano_Bytes": os.path.getsize(path) if os.path.isfile(path) else 0,
-        "Fecha_Modificacion": format_datetime(os.path.getmtime(path)) if os.path.isfile(path) else "Desconocido",
+        # Huellas y tamaño siempre disponibles (no requieren SW)
+        **binary_info,
+        "Tamano_Bytes": os.path.getsize(path) if exists else 0,
+        "Fecha_Modificacion": format_datetime(os.path.getmtime(path)) if exists else "Desconocido",
         "Extension": os.path.splitext(path)[1].lower(),
         "Feature_Count": 0, "Feature_Types": "", "Feature_Names": "",
-        "Feature_Signature": "", "Custom_Props": {}, "Summary_Info": {},
+        "Feature_Signature": "", "Feature_Structure": "[]",
+        "Geometry_Data": "{}", "Component_Count": 0, "Component_Structure": "[]",
+        "Custom_Props": {}, "Summary_Info": {},
         "Metadata_Status": "sin_metadata", "Confidence": 0, "Error": "",
     }
 
@@ -680,13 +867,12 @@ def extract_solidworks_document(path: str, session: SolidWorksSession) -> Dict[s
     sw_app = session.connect()
     shell_meta  = _read_shell_metadata(path)
     owner_full  = shell_meta.get("owner", "")
-    owner_short = shell_meta.get("owner_short", "")
     computer    = shell_meta.get("computer_name", "")
 
     file_info = {
         "Extension":          os.path.splitext(path)[1].lower(),
         "Tamano_Bytes":       os.path.getsize(path),
-        "Hash_Corto":         fast_file_hash(path),
+        **binary_info,
         "Fecha_Modificacion": format_datetime(os.path.getmtime(path)),
     }
 
@@ -755,6 +941,17 @@ def extract_solidworks_document(path: str, session: SolidWorksSession) -> Dict[s
         feat_types = " > ".join(r["token_type"] for r in feat_rows if r.get("token_type"))
         feat_names = " > ".join(r["token_name"] for r in feat_rows if r.get("token_name"))
         feat_sig   = _sig(feat_rows)
+        feat_structure = [
+            {
+                "type": row.get("token_type", ""),
+                "depth": int(row.get("depth", 0)),
+                "parameters": row.get("parameters", []),
+                "sketch": row.get("sketch", {}),
+            }
+            for row in feat_rows
+        ]
+        geometry = _read_geometry(model)
+        components = _read_components(model)
 
         # ── Confianza ─────────────────────────────────────────────────────
         conf = 0
@@ -763,6 +960,8 @@ def extract_solidworks_document(path: str, session: SolidWorksSession) -> Dict[s
         if author_original != "Desconocido":  conf += 25
         if fc_sw:                             conf += 15
         if fs_sw:                             conf += 10
+        if geometry:                          conf += 10
+        if components:                        conf += 5
 
         return {
             **file_info,
@@ -785,6 +984,16 @@ def extract_solidworks_document(path: str, session: SolidWorksSession) -> Dict[s
             "Feature_Types":     feat_types,
             "Feature_Names":     feat_names,
             "Feature_Signature": feat_sig,
+            "Feature_Structure": json.dumps(
+                feat_structure, ensure_ascii=False, separators=(",", ":")
+            ),
+            "Geometry_Data": json.dumps(
+                geometry, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+            "Component_Count": len(components),
+            "Component_Structure": json.dumps(
+                components, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
             "Custom_Props":      custom_props,
             "Summary_Info":      summary_info,
             "Metadata_Status":   _mlabel(author_original, ultimo_guardado),
